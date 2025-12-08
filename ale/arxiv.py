@@ -10,8 +10,6 @@ from typing import List
 
 import internetarchive as ia
 
-from . import ARCHIVE_DIR, LATEX_DIR
-
 try:
     import boto3
     has_boto3 = True
@@ -20,14 +18,16 @@ except ImportError:
 
 
 class BaseDownloader(ABC):
-    def _make_filter(self, timestamp, exclude=list()):  # only these files seem to contain source files (opposed to only pdf)
+    def __init__(self, tmp_storage_dir):
+        super().__init__()
+        self.tmp_storage_dir = tmp_storage_dir
+
+    def _make_filter(self, start_timestamp, end_timestamp, exclude=list()):  # only these files seem to contain source files (opposed to only pdf)
         def _filter(item):
             is_src = lambda: "_src_" in item
             is_excluded = lambda: any(ex in item for ex in exclude)
-            too_old = lambda: self._to_timestamp(item) < timestamp
-            already_processed = lambda: any(extracted.startswith(item) for extracted in listdir(LATEX_DIR))
-
-            return is_src() and not is_excluded() and not too_old() and not already_processed()
+            valid = lambda: start_timestamp <=  self._to_timestamp(item) <= end_timestamp
+            return is_src() and valid() and not is_excluded()
 
         return _filter
 
@@ -43,8 +43,9 @@ class BaseDownloader(ABC):
     def _item_download(self, identifier, index, verbose=False, **kwargs):
         """Source specific implementation of item downloading."""
 
-    def download(self, lazy=False, cutoff=datetime.fromtimestamp(0), exclude=list(), **dl_kwargs):
-        archives = sorted(filter(self._make_filter(cutoff, exclude), self.items), key=self._to_timestamp, reverse=True) # sort by date
+    def download(self, lazy, start_time, end_time, exclude=list(), **dl_kwargs):
+        archives = sorted(filter(self._make_filter(start_time, end_time,  exclude), self.items), key=self._to_timestamp, reverse=True) # sort by date
+        print(f"{type(self)} - archived tar files to download: {len(archives)}")
         for idx, item in enumerate(archives):
             if lazy:
                 yield partial(self._item_download, item, idx, **dl_kwargs)
@@ -57,10 +58,10 @@ class ArchiveDownloader(BaseDownloader):
     def items(self):
         return [item['identifier'] for item in ia.search_items('collection:arxiv-bulk')]
 
-    def _item_download(self, identifier, index, verbose=False, pattern="*.tar", timeout=TIMEOUT_MAX, **_):
+    def _item_download(self, identifier, index, verbose=False, pattern="*.tar", timeout=30, **_):
         item = ia.get_item(identifier, request_kwargs=dict(timeout=timeout))
-        item.download(destdir=ARCHIVE_DIR, verbose=verbose, glob_pattern=pattern, item_index=index, timeout=timeout)
-        return join(ARCHIVE_DIR, identifier)
+        item.download(destdir=self.tmp_storage_dir, verbose=verbose, glob_pattern=pattern, item_index=index, timeout=timeout)
+        return join(self.tmp_storage_dir, identifier)
 
 
 class S3Downloader(BaseDownloader):
@@ -105,7 +106,7 @@ class S3Downloader(BaseDownloader):
             return list()
 
     def _item_download(self, identifier, index, verbose=False, **_):
-        src_file, target_dir = f"{identifier}.tar", join(ARCHIVE_DIR, identifier)
+        src_file, target_dir = f"{identifier}.tar", join(self.tmp_storage_dir, identifier)
 
         if verbose:
             print(f"Downloading {identifier} ({index})...")
@@ -121,15 +122,18 @@ class S3Downloader(BaseDownloader):
         if verbose:
             print(f"Finished downloading {identifier} ({index}).")
 
-        return join(ARCHIVE_DIR, identifier)
+        return join(self.tmp_storage_dir, identifier)
 
 
 def download(*args, **kwargs):
-    arxiv, s3 = ArchiveDownloader(), S3Downloader()
+    arxiv, s3 = ArchiveDownloader(kwargs['tmp_storage_dir']), S3Downloader(kwargs['tmp_storage_dir'])
 
     yield from arxiv.download(*args, **kwargs)
-    yield from s3.download(*args, exclude=arxiv.items, **kwargs)
+    if 'exclude' in kwargs:
+        kwargs['exclude'].extend(arxiv.items)
+    else:
+        kwargs['exclude'] = arxiv.items
+    yield from s3.download(*args, **kwargs)
 
 def delete(path):
-    if path.startswith(ARCHIVE_DIR):
-        rmtree(path)
+    rmtree(path)

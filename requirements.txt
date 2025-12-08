@@ -1,2 +1,4 @@
 internetarchive==4.1.0
 tqdm==4.66.5
+azure-storage-blob
+azure-identity
